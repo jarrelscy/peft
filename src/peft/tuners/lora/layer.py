@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import math
 import warnings
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Any, Optional, Union
 
 import torch
@@ -122,10 +122,190 @@ class LoraLayer(BaseTunerLayer):
         self.lora_variant: dict[str, LoraVariant] = {}
         self.kwargs = kwargs
 
+        self.use_oplora: dict[str, bool] = {}
+        self.oplora_rank: dict[str, int] = {}
+        self._oplora_left_vectors = BufferDict(persistent=False)
+        self._oplora_right_vectors = BufferDict(persistent=False)
+
         base_layer = self.get_base_layer()
         in_features, out_features = _get_in_out_features(base_layer)
         self.in_features = in_features
         self.out_features = out_features
+
+    def _clear_oplora_state(self, adapter_name: str) -> None:
+        self.use_oplora.pop(adapter_name, None)
+        self.oplora_rank.pop(adapter_name, None)
+        if adapter_name in self._oplora_left_vectors:
+            del self._oplora_left_vectors[adapter_name]
+        if adapter_name in self._oplora_right_vectors:
+            del self._oplora_right_vectors[adapter_name]
+
+    def _get_oplora_reference_weight(self) -> Optional[torch.Tensor]:
+        base_layer = self.get_base_layer()
+        weight = getattr(base_layer, "weight", None)
+        if weight is None:
+            return None
+
+        bnb_param_type = get_bnb_param_type(weight)
+        if bnb_param_type:
+            weight_tensor = dequantize_module_weight(base_layer)
+        else:
+            weight_tensor = weight
+
+        weight_tensor = transpose(weight_tensor, getattr(self, "fan_in_fan_out", False))
+        return weight_tensor.detach()
+
+    def _compute_truncated_svd(self, matrix: torch.Tensor, rank: int) -> tuple[torch.Tensor, torch.Tensor]:
+        matrix = matrix.to(torch.float32)
+        try:
+            U, S, V = svd_lowrank(matrix, q=rank, niter=4)
+            if U.shape[1] >= rank and V.shape[1] >= rank:
+                return U[:, :rank], V[:, :rank]
+        except RuntimeError:
+            pass
+
+        U, S, Vh = torch.linalg.svd(matrix, full_matrices=False)
+        return U[:, :rank], Vh[:rank, :].transpose(0, 1)
+
+    def _configure_oplora(self, adapter_name: str, use_oplora: bool, op_lora_k: Optional[int]) -> None:
+        self._clear_oplora_state(adapter_name)
+
+        if not use_oplora:
+            return
+
+        if op_lora_k is None:
+            raise ValueError("`op_lora_k` must be specified when `use_oplora=True`.")
+        if op_lora_k <= 0:
+            raise ValueError("`op_lora_k` must be a positive integer.")
+
+        weight_param = getattr(self.get_base_layer(), "weight", None)
+        gather_ctx = gather_params_ctx(weight_param) if weight_param is not None else nullcontext()
+        with gather_ctx:
+            weight_tensor = self._get_oplora_reference_weight()
+
+        if weight_tensor is None:
+            raise ValueError("OPLoRA is not supported for the selected layer type.")
+
+        if weight_tensor.ndim != 2:
+            raise ValueError("OPLoRA currently supports only 2D weight matrices.")
+
+        m, n = weight_tensor.shape
+        effective_rank = min(op_lora_k, m, n)
+        if effective_rank <= 0:
+            raise ValueError("`op_lora_k` is too large for the target layer.")
+
+        U, V = self._compute_truncated_svd(weight_tensor, effective_rank)
+        if adapter_name in self.lora_B:
+            left_weight = self.lora_B[adapter_name].weight
+        elif adapter_name in self.lora_embedding_B:
+            left_weight = self.lora_embedding_B[adapter_name]
+        else:
+            left_weight = weight_tensor
+
+        if adapter_name in self.lora_A:
+            right_weight = self.lora_A[adapter_name].weight
+        elif adapter_name in self.lora_embedding_A:
+            right_weight = self.lora_embedding_A[adapter_name]
+        else:
+            right_weight = weight_tensor
+
+        left_device = left_weight.device
+        left_dtype = left_weight.dtype
+        right_device = right_weight.device
+        right_dtype = right_weight.dtype
+
+        self._oplora_left_vectors[adapter_name] = U.to(device=left_device, dtype=left_dtype)
+        self._oplora_right_vectors[adapter_name] = V.to(device=right_device, dtype=right_dtype)
+        self.use_oplora[adapter_name] = True
+        self.oplora_rank[adapter_name] = effective_rank
+
+    def _apply_left_projector(self, adapter: str, tensor: torch.Tensor) -> torch.Tensor:
+        if tensor is None:
+            return tensor
+
+        if adapter not in self._oplora_left_vectors:
+            return tensor
+
+        projector_basis = self._oplora_left_vectors[adapter]
+        projector_basis = projector_basis.to(device=tensor.device, dtype=tensor.dtype)
+
+        if tensor.ndim == 1:
+            tensor_2d = tensor.unsqueeze(-1)
+            projected = tensor_2d - projector_basis @ (projector_basis.transpose(0, 1) @ tensor_2d)
+            return projected.squeeze(-1)
+
+        return tensor - projector_basis @ (projector_basis.transpose(0, 1) @ tensor)
+
+    def _apply_right_projector(self, adapter: str, tensor: torch.Tensor) -> torch.Tensor:
+        if tensor is None:
+            return tensor
+
+        if adapter not in self._oplora_right_vectors:
+            return tensor
+
+        projector_basis = self._oplora_right_vectors[adapter]
+        projector_basis = projector_basis.to(device=tensor.device, dtype=tensor.dtype)
+
+        if tensor.ndim == 1:
+            tensor_2d = tensor.unsqueeze(0)
+            projected = tensor_2d - (tensor_2d @ projector_basis) @ projector_basis.transpose(0, 1)
+            return projected.squeeze(0)
+
+        return tensor - (tensor @ projector_basis) @ projector_basis.transpose(0, 1)
+
+    def _get_projected_lora_weights(
+        self,
+        adapter: str,
+        weight_A: torch.Tensor,
+        weight_B: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        if not self.use_oplora.get(adapter, False):
+            return weight_A, weight_B, bias
+
+        if adapter not in self._oplora_left_vectors or adapter not in self._oplora_right_vectors:
+            return weight_A, weight_B, bias
+
+        projected_B = self._apply_left_projector(adapter, weight_B)
+        projected_A = self._apply_right_projector(adapter, weight_A)
+
+        projected_bias = bias
+        if bias is not None:
+            projected_bias = self._apply_left_projector(
+                adapter,
+                bias.to(device=weight_B.device, dtype=weight_B.dtype),
+            )
+
+        return projected_A, projected_B, projected_bias
+
+    @torch.no_grad()
+    def compute_subspace_alignment(self, adapter_name: str, top_k: Optional[int] = None) -> float:
+        weight_tensor = self._get_oplora_reference_weight()
+        if weight_tensor is None:
+            raise ValueError("Subspace alignment is not supported for the selected layer type.")
+
+        if weight_tensor.ndim != 2:
+            raise ValueError("Subspace alignment is currently defined for 2D weight matrices only.")
+
+        m, n = weight_tensor.shape
+        if top_k is None:
+            top_k = self.oplora_rank.get(adapter_name, min(m, n))
+
+        rank = min(top_k, m, n)
+        if rank <= 0:
+            raise ValueError("`top_k` must be positive and not exceed the matrix rank.")
+
+        U, V = self._compute_truncated_svd(weight_tensor, rank)
+
+        delta_weight = transpose(self.get_delta_weight(adapter_name), getattr(self, "fan_in_fan_out", False))
+        delta_weight = delta_weight.to(torch.float32)
+
+        denominator = torch.linalg.norm(delta_weight)
+        if denominator == 0:
+            return 0.0
+
+        alignment = torch.linalg.norm(U[:, :rank].T @ delta_weight @ V[:, :rank])
+        return (alignment / denominator).item()
 
     def resolve_lora_variant(self, *, use_dora: bool, **kwargs) -> Optional[LoraVariant]:
         """Return a matching LoRA variant for this layer type.
@@ -152,6 +332,8 @@ class LoraLayer(BaseTunerLayer):
         use_dora: bool = False,
         use_alora: bool = False,
         use_qalora: bool = False,
+        use_oplora: bool = False,
+        op_lora_k: Optional[int] = None,
         lora_bias: bool = False,
         arrow_config: ArrowConfig = None,
         qalora_group_size: int = 32,
@@ -229,8 +411,12 @@ class LoraLayer(BaseTunerLayer):
         # call this before init of the lora variants
         self._move_adapter_to_device_of_base_layer(adapter_name)
 
+        kwargs.pop("use_oplora", None)
+        kwargs.pop("op_lora_k", None)
         if adapter_name in self.lora_variant:
             self.lora_variant[adapter_name].init(self, **kwargs)
+
+        self._configure_oplora(adapter_name, use_oplora=use_oplora, op_lora_k=op_lora_k)
 
         self.set_adapter(self.active_adapters, inference_mode=inference_mode)
 
@@ -620,6 +806,8 @@ class Linear(nn.Module, LoraLayer):
         self.fan_in_fan_out = fan_in_fan_out
 
         self._active_adapter = adapter_name
+        use_oplora = kwargs.pop("use_oplora", False)
+        op_lora_k = kwargs.pop("op_lora_k", None)
         self.update_layer(
             adapter_name,
             r,
@@ -629,6 +817,8 @@ class Linear(nn.Module, LoraLayer):
             use_rslora=use_rslora,
             use_dora=use_dora,
             use_alora=use_alora,
+            use_oplora=use_oplora,
+            op_lora_k=op_lora_k,
             lora_bias=lora_bias,
             arrow_config=arrow_config,
         )
@@ -765,7 +955,8 @@ class Linear(nn.Module, LoraLayer):
             weight_A = weight_A.float()
             weight_B = weight_B.float()
 
-        output_tensor = transpose(weight_B @ weight_A, self.fan_in_fan_out) * self.scaling[adapter]
+        projected_A, projected_B, _ = self._get_projected_lora_weights(adapter, weight_A, weight_B)
+        output_tensor = transpose(projected_B @ projected_A, self.fan_in_fan_out) * self.scaling[adapter]
 
         if cast_to_fp32:
             output_tensor = output_tensor.to(dtype=dtype)
@@ -804,7 +995,18 @@ class Linear(nn.Module, LoraLayer):
                 scaling = self.scaling[active_adapter]
                 x = self._cast_input_dtype(x, lora_A.weight.dtype)
                 if active_adapter not in self.lora_variant:  # vanilla LoRA
-                    result = result + lora_B(lora_A(dropout(x))) * scaling
+                    dropped_input = dropout(x)
+                    if self.use_oplora.get(active_adapter, False):
+                        projected_A, projected_B, projected_bias = self._get_projected_lora_weights(
+                            active_adapter,
+                            lora_A.weight,
+                            lora_B.weight,
+                            lora_B.bias,
+                        )
+                        intermediate = F.linear(dropped_input, projected_A)
+                        result = result + F.linear(intermediate, projected_B, projected_bias) * scaling
+                    else:
+                        result = result + lora_B(lora_A(dropped_input)) * scaling
                 else:
                     result = self.lora_variant[active_adapter].forward(
                         self,
@@ -850,6 +1052,8 @@ class Embedding(nn.Module, LoraLayer):
         self.fan_in_fan_out = fan_in_fan_out
 
         self._active_adapter = adapter_name
+        use_oplora = kwargs.pop("use_oplora", False)
+        op_lora_k = kwargs.pop("op_lora_k", None)
         self.update_layer(
             adapter_name,
             r,
@@ -858,6 +1062,8 @@ class Embedding(nn.Module, LoraLayer):
             init_lora_weights=init_lora_weights,
             use_rslora=use_rslora,
             use_dora=use_dora,
+            use_oplora=use_oplora,
+            op_lora_k=op_lora_k,
             lora_bias=lora_bias,
             arrow_config=arrow_config,
         )
@@ -879,7 +1085,9 @@ class Embedding(nn.Module, LoraLayer):
         init_lora_weights,
         use_rslora,
         use_dora,
-        lora_bias,
+        use_oplora: bool = False,
+        op_lora_k: Optional[int] = None,
+        lora_bias: bool = False,
         arrow_config: ArrowConfig = None,
         inference_mode: bool = False,
         **kwargs,
@@ -927,8 +1135,12 @@ class Embedding(nn.Module, LoraLayer):
         # call this before init of the lora variants
         self._move_adapter_to_device_of_base_layer(adapter_name)
 
+        kwargs.pop("use_oplora", None)
+        kwargs.pop("op_lora_k", None)
         if adapter_name in self.lora_variant:
             self.lora_variant[adapter_name].init(self, **kwargs)
+
+        self._configure_oplora(adapter_name, use_oplora=use_oplora, op_lora_k=op_lora_k)
 
         self.set_adapter(self.active_adapters, inference_mode=inference_mode)
 
@@ -1017,7 +1229,8 @@ class Embedding(nn.Module, LoraLayer):
             weight_A = weight_A.float()
             weight_B = weight_B.float()
 
-        output_tensor = transpose(weight_B @ weight_A, True) * self.scaling[adapter]
+        projected_A, projected_B, _ = self._get_projected_lora_weights(adapter, weight_A, weight_B)
+        output_tensor = transpose(projected_B @ projected_A, True) * self.scaling[adapter]
 
         if cast_to_fp32:
             output_tensor = output_tensor.to(dtype=dtype)
@@ -1050,8 +1263,13 @@ class Embedding(nn.Module, LoraLayer):
             if active_adapter not in self.lora_embedding_A.keys():
                 continue
 
-            embedding_A = self.lora_embedding_A[active_adapter].T
-            embedding_B = self.lora_embedding_B[active_adapter].T
+            projected_A, projected_B, _ = self._get_projected_lora_weights(
+                active_adapter,
+                self.lora_embedding_A[active_adapter],
+                self.lora_embedding_B[active_adapter],
+            )
+            embedding_A = projected_A.T
+            embedding_B = projected_B.T
             scaling = self.scaling[active_adapter]
 
             # getting the sub-batch, passing it to LoRA layers and updating the corresponding indices of the linear
@@ -1106,8 +1324,13 @@ class Embedding(nn.Module, LoraLayer):
                     continue
 
                 if active_adapter not in self.lora_variant:  # vanilla LoRA
-                    embedding_A = self.lora_embedding_A[active_adapter].T
-                    embedding_B = self.lora_embedding_B[active_adapter].T
+                    projected_A, projected_B, _ = self._get_projected_lora_weights(
+                        active_adapter,
+                        self.lora_embedding_A[active_adapter],
+                        self.lora_embedding_B[active_adapter],
+                    )
+                    embedding_A = projected_A.T
+                    embedding_B = projected_B.T
                     scaling = self.scaling[active_adapter]
                     after_A = self._embed(x, embedding_A)
                     adapter_output = (after_A @ embedding_B) * scaling
@@ -1168,6 +1391,9 @@ class _ConvNd(nn.Module, LoraLayer):
         self._active_adapter = adapter_name
         self._kernel_dim = base_layer.weight.dim()
 
+        use_oplora = kwargs.pop("use_oplora", False)
+        op_lora_k = kwargs.pop("op_lora_k", None)
+
         self.update_layer(
             adapter_name,
             r,
@@ -1176,6 +1402,8 @@ class _ConvNd(nn.Module, LoraLayer):
             init_lora_weights=init_lora_weights,
             use_rslora=use_rslora,
             use_dora=use_dora,
+            use_oplora=use_oplora,
+            op_lora_k=op_lora_k,
             lora_bias=lora_bias,
             arrow_config=arrow_config,
         )
@@ -1189,7 +1417,9 @@ class _ConvNd(nn.Module, LoraLayer):
         init_lora_weights,
         use_rslora,
         use_dora,
-        lora_bias,
+        use_oplora: bool = False,
+        op_lora_k: Optional[int] = None,
+        lora_bias: bool = False,
         arrow_config: ArrowConfig = None,
         inference_mode: bool = False,
         **kwargs,
@@ -1241,6 +1471,9 @@ class _ConvNd(nn.Module, LoraLayer):
         self.use_rslora[adapter_name] = use_rslora
 
         self.use_dora[adapter_name] = use_dora
+
+        if use_oplora:
+            raise ValueError("OPLoRA is not currently supported for convolutional LoRA layers.")
 
         if init_lora_weights == "loftq":
             self.loftq_init(adapter_name)
@@ -1539,6 +1772,8 @@ class MultiheadAttention(nn.Module, LoraLayer):
         LoraLayer.__init__(self, base_layer, **kwargs)
 
         # Note: LoRA is applied to both in_proj and out_proj. There is currently no way to only specify one of them.
+        use_oplora = kwargs.get("use_oplora", False)
+        op_lora_k = kwargs.get("op_lora_k", None)
         if isinstance(base_layer.out_proj, nn.Linear):
             self.base_layer.out_proj = Linear(
                 base_layer.out_proj,
@@ -1549,13 +1784,24 @@ class MultiheadAttention(nn.Module, LoraLayer):
                 init_lora_weights=init_lora_weights,
                 use_rslora=use_rslora,
                 use_dora=use_dora,
+                use_oplora=use_oplora,
+                op_lora_k=op_lora_k,
                 **kwargs,
             )
         else:
             raise ValueError(f"out_proj must be an instance of nn.Linear for {self.__class__.__name__}.")
 
         self._active_adapter = adapter_name
-        self.update_layer(adapter_name, r, lora_alpha, lora_dropout, init_lora_weights, use_rslora)
+        self.update_layer(
+            adapter_name,
+            r,
+            lora_alpha,
+            lora_dropout,
+            init_lora_weights,
+            use_rslora,
+            use_oplora=use_oplora,
+            op_lora_k=op_lora_k,
+        )
 
     @property
     def embed_dim(self) -> int:
@@ -1950,6 +2196,8 @@ class ParamWrapper(nn.Module, LoraLayer):
 
         self.fan_in_fan_out = fan_in_fan_out
         self._active_adapter = adapter_name
+        use_oplora = kwargs.pop("use_oplora", False)
+        op_lora_k = kwargs.pop("op_lora_k", None)
         self.update_layer(
             adapter_name,
             r,
@@ -1958,6 +2206,8 @@ class ParamWrapper(nn.Module, LoraLayer):
             init_lora_weights=init_lora_weights,
             use_rslora=use_rslora,
             use_dora=use_dora,
+            use_oplora=use_oplora,
+            op_lora_k=op_lora_k,
             lora_bias=lora_bias,
         )
 
@@ -1971,6 +2221,8 @@ class ParamWrapper(nn.Module, LoraLayer):
         use_rslora,
         use_dora: bool = False,
         use_qalora: bool = False,
+        use_oplora: bool = False,
+        op_lora_k: Optional[int] = None,
         lora_bias: bool = False,
         qalora_group_size: int = 32,
         inference_mode: bool = False,
@@ -2040,8 +2292,12 @@ class ParamWrapper(nn.Module, LoraLayer):
         # call this before init of the lora variants
         self._move_adapter_to_device_of_base_layer(adapter_name)
 
+        kwargs.pop("use_oplora", None)
+        kwargs.pop("op_lora_k", None)
         if adapter_name in self.lora_variant:
             self.lora_variant[adapter_name].init(self, **kwargs)
+
+        self._configure_oplora(adapter_name, use_oplora=use_oplora, op_lora_k=op_lora_k)
 
         self.set_adapter(self.active_adapters, inference_mode=inference_mode)
 
@@ -2066,6 +2322,12 @@ class ParamWrapper(nn.Module, LoraLayer):
                 adapter_layer[adapter_name] = adapter_layer[adapter_name].to(device, dtype=param.dtype)
             else:
                 adapter_layer[adapter_name] = adapter_layer[adapter_name].to(device)
+
+    def _get_oplora_reference_weight(self) -> Optional[torch.Tensor]:
+        param = self.get_param()
+        if param.ndim != 2:
+            return None
+        return param.detach()
 
     def get_param(self):
         param = getattr(self.get_base_layer(), self.parameter_name)

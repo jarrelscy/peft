@@ -571,6 +571,24 @@ class LoraConfig(PeftConfig):
             )
         },
     )
+    use_oplora: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Enable Orthogonal Projection LoRA (OPLoRA). When enabled, LoRA updates are projected away from the top"
+                " singular subspace of the frozen weights to preserve pretrained knowledge."
+            )
+        },
+    )
+    op_lora_k: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Number of top singular vectors used to build the OPLoRA projectors. This value is required when"
+                " `use_oplora=True`."
+            )
+        },
+    )
     alora_invocation_tokens: Optional[list[int]] = field(
         default=None,
         metadata={
@@ -713,6 +731,14 @@ class LoraConfig(PeftConfig):
 
         if self.use_dora and self.megatron_config:
             raise ValueError("DoRA does not support megatron_core, please set `use_dora=False`.")
+
+        if self.use_oplora:
+            if self.op_lora_k is None:
+                raise ValueError("`op_lora_k` must be specified when `use_oplora=True`.")
+            if self.op_lora_k <= 0:
+                raise ValueError("`op_lora_k` must be a positive integer.")
+        elif self.op_lora_k is not None:
+            warnings.warn("`op_lora_k` specified but `use_oplora` is False. The value will be ignored.")
 
         # handle init_lora_weights and loftq_config
         if self.init_lora_weights == "loftq":
