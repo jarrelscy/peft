@@ -187,14 +187,26 @@ def test_oplora_with_nanogpt_forward_backward(tmp_path):
             module.lora_B[adapter_name].bias,
         )
         assert projected_bias is None
-        U = module._oplora_left_vectors[adapter_name]
-        V = module._oplora_right_vectors[adapter_name]
+        assert adapter_name in module._oplora_left_projectors
+        assert adapter_name in module._oplora_right_projectors
 
         with torch.no_grad():
-            left_projection = U.transpose(0, 1) @ projected_B
-            right_projection = projected_A @ V
-            delta_weight = projected_B @ projected_A
-            interference = U.transpose(0, 1) @ delta_weight @ V
+            weight_matrix = module._get_oplora_reference_weight().to(torch.float32)
+            U, _, Vh = torch.linalg.svd(weight_matrix, full_matrices=False)
+            top_k = module.oplora_rank[adapter_name]
+            U_top = U[:, :top_k]
+            V_top = Vh[:top_k, :].transpose(0, 1)
+
+            left_projector = module._oplora_left_projectors[adapter_name].to(projected_B.device, projected_B.dtype)
+            right_projector = module._oplora_right_projectors[adapter_name].to(projected_A.device, projected_A.dtype)
+
+            assert torch.allclose(left_projector @ projected_B, projected_B, atol=1e-4, rtol=1e-4)
+            assert torch.allclose(projected_A @ right_projector, projected_A, atol=1e-4, rtol=1e-4)
+
+            left_projection = U_top.transpose(0, 1) @ projected_B.to(torch.float32)
+            right_projection = projected_A.to(torch.float32) @ V_top
+            delta_weight = projected_B.to(torch.float32) @ projected_A.to(torch.float32)
+            interference = U_top.transpose(0, 1) @ delta_weight @ V_top
 
         assert torch.allclose(left_projection, torch.zeros_like(left_projection), atol=1e-4, rtol=1e-4)
         assert torch.allclose(right_projection, torch.zeros_like(right_projection), atol=1e-4, rtol=1e-4)

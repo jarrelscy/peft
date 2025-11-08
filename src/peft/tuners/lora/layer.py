@@ -124,8 +124,8 @@ class LoraLayer(BaseTunerLayer):
 
         self.use_oplora: dict[str, bool] = {}
         self.oplora_rank: dict[str, int] = {}
-        self._oplora_left_vectors = BufferDict(persistent=False)
-        self._oplora_right_vectors = BufferDict(persistent=False)
+        self._oplora_left_projectors = BufferDict(persistent=False)
+        self._oplora_right_projectors = BufferDict(persistent=False)
 
         base_layer = self.get_base_layer()
         in_features, out_features = _get_in_out_features(base_layer)
@@ -135,10 +135,10 @@ class LoraLayer(BaseTunerLayer):
     def _clear_oplora_state(self, adapter_name: str) -> None:
         self.use_oplora.pop(adapter_name, None)
         self.oplora_rank.pop(adapter_name, None)
-        if adapter_name in self._oplora_left_vectors:
-            del self._oplora_left_vectors[adapter_name]
-        if adapter_name in self._oplora_right_vectors:
-            del self._oplora_right_vectors[adapter_name]
+        if adapter_name in self._oplora_left_projectors:
+            del self._oplora_left_projectors[adapter_name]
+        if adapter_name in self._oplora_right_projectors:
+            del self._oplora_right_projectors[adapter_name]
 
     def _get_oplora_reference_weight(self) -> Optional[torch.Tensor]:
         base_layer = self.get_base_layer()
@@ -158,14 +158,15 @@ class LoraLayer(BaseTunerLayer):
     def _compute_truncated_svd(self, matrix: torch.Tensor, rank: int) -> tuple[torch.Tensor, torch.Tensor]:
         matrix = matrix.to(torch.float32)
         try:
-            U, S, V = svd_lowrank(matrix, q=rank, niter=4)
-            if U.shape[1] >= rank and V.shape[1] >= rank:
-                return U[:, :rank], V[:, :rank]
+            U, S, Vh = torch.linalg.svd(matrix, full_matrices=False)
+            return U[:, :rank], Vh[:rank, :].transpose(0, 1)
         except RuntimeError:
             pass
 
-        U, S, Vh = torch.linalg.svd(matrix, full_matrices=False)
-        return U[:, :rank], Vh[:rank, :].transpose(0, 1)
+        U, S, V = svd_lowrank(matrix, q=rank, niter=8)
+        if U.shape[1] < rank or V.shape[1] < rank:
+            raise RuntimeError("Failed to compute truncated SVD for OPLoRA projector construction.")
+        return U[:, :rank], V[:, :rank]
 
     def _configure_oplora(self, adapter_name: str, use_oplora: bool, op_lora_k: Optional[int]) -> None:
         self._clear_oplora_state(adapter_name)
@@ -195,6 +196,9 @@ class LoraLayer(BaseTunerLayer):
             raise ValueError("`op_lora_k` is too large for the target layer.")
 
         U, V = self._compute_truncated_svd(weight_tensor, effective_rank)
+        left_projector = torch.eye(m, dtype=torch.float32, device=weight_tensor.device) - U @ U.transpose(0, 1)
+        right_projector = torch.eye(n, dtype=torch.float32, device=weight_tensor.device) - V @ V.transpose(0, 1)
+
         if adapter_name in self.lora_B:
             left_weight = self.lora_B[adapter_name].weight
         elif adapter_name in self.lora_embedding_B:
@@ -214,44 +218,10 @@ class LoraLayer(BaseTunerLayer):
         right_device = right_weight.device
         right_dtype = right_weight.dtype
 
-        self._oplora_left_vectors[adapter_name] = U.to(device=left_device, dtype=left_dtype)
-        self._oplora_right_vectors[adapter_name] = V.to(device=right_device, dtype=right_dtype)
+        self._oplora_left_projectors[adapter_name] = left_projector.to(device=left_device, dtype=left_dtype)
+        self._oplora_right_projectors[adapter_name] = right_projector.to(device=right_device, dtype=right_dtype)
         self.use_oplora[adapter_name] = True
         self.oplora_rank[adapter_name] = effective_rank
-
-    def _apply_left_projector(self, adapter: str, tensor: torch.Tensor) -> torch.Tensor:
-        if tensor is None:
-            return tensor
-
-        if adapter not in self._oplora_left_vectors:
-            return tensor
-
-        projector_basis = self._oplora_left_vectors[adapter]
-        projector_basis = projector_basis.to(device=tensor.device, dtype=tensor.dtype)
-
-        if tensor.ndim == 1:
-            tensor_2d = tensor.unsqueeze(-1)
-            projected = tensor_2d - projector_basis @ (projector_basis.transpose(0, 1) @ tensor_2d)
-            return projected.squeeze(-1)
-
-        return tensor - projector_basis @ (projector_basis.transpose(0, 1) @ tensor)
-
-    def _apply_right_projector(self, adapter: str, tensor: torch.Tensor) -> torch.Tensor:
-        if tensor is None:
-            return tensor
-
-        if adapter not in self._oplora_right_vectors:
-            return tensor
-
-        projector_basis = self._oplora_right_vectors[adapter]
-        projector_basis = projector_basis.to(device=tensor.device, dtype=tensor.dtype)
-
-        if tensor.ndim == 1:
-            tensor_2d = tensor.unsqueeze(0)
-            projected = tensor_2d - (tensor_2d @ projector_basis) @ projector_basis.transpose(0, 1)
-            return projected.squeeze(0)
-
-        return tensor - (tensor @ projector_basis) @ projector_basis.transpose(0, 1)
 
     def _get_projected_lora_weights(
         self,
@@ -263,18 +233,21 @@ class LoraLayer(BaseTunerLayer):
         if not self.use_oplora.get(adapter, False):
             return weight_A, weight_B, bias
 
-        if adapter not in self._oplora_left_vectors or adapter not in self._oplora_right_vectors:
+        if adapter not in self._oplora_left_projectors or adapter not in self._oplora_right_projectors:
             return weight_A, weight_B, bias
 
-        projected_B = self._apply_left_projector(adapter, weight_B)
-        projected_A = self._apply_right_projector(adapter, weight_A)
+        left_projector = self._oplora_left_projectors[adapter]
+        right_projector = self._oplora_right_projectors[adapter]
+
+        left_projector = left_projector.to(device=weight_B.device, dtype=weight_B.dtype)
+        right_projector = right_projector.to(device=weight_A.device, dtype=weight_A.dtype)
+
+        projected_B = left_projector @ weight_B
+        projected_A = weight_A @ right_projector
 
         projected_bias = bias
         if bias is not None:
-            projected_bias = self._apply_left_projector(
-                adapter,
-                bias.to(device=weight_B.device, dtype=weight_B.dtype),
-            )
+            projected_bias = left_projector @ bias.to(device=weight_B.device, dtype=weight_B.dtype)
 
         return projected_A, projected_B, projected_bias
 
