@@ -140,6 +140,7 @@ def test_oplora_with_nanogpt_forward_backward(tmp_path):
         target_modules=["c_attn", "c_proj", "c_fc"],
         use_oplora=True,
         op_lora_k=4,
+        lora_bias=True,
         task_type=TaskType.CAUSAL_LM,
     )
 
@@ -186,7 +187,8 @@ def test_oplora_with_nanogpt_forward_backward(tmp_path):
             module.lora_B[adapter_name].weight,
             module.lora_B[adapter_name].bias,
         )
-        assert projected_bias is None
+        assert projected_bias is not None
+        assert projected_bias.shape == module.lora_B[adapter_name].bias.shape
         assert adapter_name in module._oplora_left_projectors
         assert adapter_name in module._oplora_right_projectors
 
@@ -207,11 +209,69 @@ def test_oplora_with_nanogpt_forward_backward(tmp_path):
             right_projection = projected_A.to(torch.float32) @ V_top
             delta_weight = projected_B.to(torch.float32) @ projected_A.to(torch.float32)
             interference = U_top.transpose(0, 1) @ delta_weight @ V_top
+            bias_projection = U_top.transpose(0, 1) @ projected_bias.to(torch.float32)
 
         assert torch.allclose(left_projection, torch.zeros_like(left_projection), atol=1e-4, rtol=1e-4)
         assert torch.allclose(right_projection, torch.zeros_like(right_projection), atol=1e-4, rtol=1e-4)
         assert torch.allclose(interference, torch.zeros_like(interference), atol=1e-4, rtol=1e-4)
+        assert torch.allclose(bias_projection, torch.zeros_like(bias_projection), atol=1e-4, rtol=1e-4)
 
         alignment = module.compute_subspace_alignment(adapter_name)
         assert 0.0 <= alignment <= 1.0
+
+    snapshots = []
+    for module in modules_to_check:
+        base_layer = module.get_base_layer()
+        weight_before = base_layer.weight.detach().clone()
+        delta_weight = module.get_delta_weight(adapter_name).detach().clone().to(weight_before.dtype)
+        bias_before = None
+        delta_bias = None
+        if getattr(base_layer, "bias", None) is not None and module.lora_bias.get(adapter_name, False):
+            bias_before = base_layer.bias.detach().clone()
+            delta_bias = module.get_delta_bias(adapter_name).detach().clone().to(bias_before.dtype)
+        snapshots.append({
+            "module": module,
+            "weight_before": weight_before,
+            "delta_weight": delta_weight,
+            "bias_before": bias_before,
+            "delta_bias": delta_bias,
+        })
+
+    peft_model.merge_adapter()
+
+    for snapshot in snapshots:
+        base_layer = snapshot["module"].get_base_layer()
+        expected_weight = snapshot["weight_before"] + snapshot["delta_weight"].to(base_layer.weight.dtype)
+        assert torch.allclose(base_layer.weight, expected_weight, atol=1e-5, rtol=1e-4)
+
+        if snapshot["bias_before"] is not None:
+            expected_bias = snapshot["bias_before"] + snapshot["delta_bias"].to(base_layer.bias.dtype)
+            assert torch.allclose(base_layer.bias, expected_bias, atol=1e-5, rtol=1e-4)
+
+    peft_model.unmerge_adapter()
+
+    for snapshot in snapshots:
+        base_layer = snapshot["module"].get_base_layer()
+        assert torch.allclose(base_layer.weight, snapshot["weight_before"], atol=1e-6, rtol=1e-5)
+        if snapshot["bias_before"] is not None:
+            assert torch.allclose(base_layer.bias, snapshot["bias_before"], atol=1e-6, rtol=1e-5)
+
+    merged_model = peft_model.merge_and_unload()
+
+    merged_first_block = merged_model.transformer["h"][0]
+    merged_modules = [
+        merged_first_block.attn.c_attn,
+        merged_first_block.attn.c_proj,
+        merged_first_block.mlp.c_fc,
+        merged_first_block.mlp.c_proj,
+    ]
+
+    for snapshot, merged_module in zip(snapshots, merged_modules):
+        assert not hasattr(merged_module, "lora_A")
+        expected_weight = snapshot["weight_before"] + snapshot["delta_weight"].to(merged_module.weight.dtype)
+        assert torch.allclose(merged_module.weight, expected_weight, atol=1e-5, rtol=1e-4)
+
+        if snapshot["bias_before"] is not None:
+            expected_bias = snapshot["bias_before"] + snapshot["delta_bias"].to(merged_module.bias.dtype)
+            assert torch.allclose(merged_module.bias, expected_bias, atol=1e-5, rtol=1e-4)
 

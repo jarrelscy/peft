@@ -251,6 +251,41 @@ class LoraLayer(BaseTunerLayer):
 
         return projected_A, projected_B, projected_bias
 
+    def get_delta_bias(self, adapter: str) -> torch.Tensor:
+        if not self.lora_bias.get(adapter, False):
+            raise ValueError(f"Adapter {adapter} does not have a LoRA bias to merge.")
+
+        if adapter not in self.lora_B:
+            raise ValueError(f"Adapter {adapter} does not define a LoRA B projection for bias handling.")
+
+        bias = self.lora_B[adapter].bias
+        if bias is None:
+            raise ValueError(f"Adapter {adapter} does not have a trainable bias parameter.")
+
+        device = bias.device
+        dtype = bias.dtype
+        cast_to_fp32 = device.type == "cpu" and (dtype == torch.float16 or dtype == torch.bfloat16)
+
+        weight_A = self.lora_A[adapter].weight
+        weight_B = self.lora_B[adapter].weight
+        if cast_to_fp32:
+            weight_A = weight_A.float()
+            weight_B = weight_B.float()
+            bias_tensor = bias.float()
+        else:
+            bias_tensor = bias
+
+        _, _, projected_bias = self._get_projected_lora_weights(adapter, weight_A, weight_B, bias_tensor)
+        if projected_bias is None:
+            projected_bias = bias_tensor
+
+        delta_bias = projected_bias * self.scaling[adapter]
+
+        if cast_to_fp32:
+            delta_bias = delta_bias.to(dtype)
+
+        return delta_bias
+
     @torch.no_grad()
     def compute_subspace_alignment(self, adapter_name: str, top_k: Optional[int] = None) -> float:
         weight_tensor = self._get_oplora_reference_weight()
@@ -859,12 +894,13 @@ class Linear(nn.Module, LoraLayer):
                             raise RuntimeError(
                                 "Impossible to merge LoRA with `lora_bias=True` because the base layer has no bias."
                             )
-                        new_bias = base_layer.bias + self.lora_B[active_adapter].bias * self.scaling[active_adapter]
+                        bias_delta = self.get_delta_bias(active_adapter).to(base_layer.bias.dtype)
+                        new_bias = base_layer.bias + bias_delta
                         if not torch.isfinite(new_bias).all():
                             raise ValueError(
                                 f"NaNs detected in the merged weights. The adapter {active_adapter} seems to be broken"
                             )
-                        base_layer.bias.data = new_bias.to(orig_dtype)
+                        base_layer.bias.data = new_bias
 
                 else:
                     if active_adapter not in self.lora_variant:  # vanilla LoRA
@@ -878,7 +914,8 @@ class Linear(nn.Module, LoraLayer):
                             raise RuntimeError(
                                 "Impossible to merge LoRA with `lora_bias=True` because the base layer has no bias."
                             )
-                        base_layer.bias.data += self.lora_B[active_adapter].bias * self.scaling[active_adapter]
+                        bias_delta = self.get_delta_bias(active_adapter).to(base_layer.bias.dtype)
+                        base_layer.bias.data += bias_delta
 
                 self.merged_adapters.append(active_adapter)
 
@@ -903,7 +940,13 @@ class Linear(nn.Module, LoraLayer):
                     weight.data = unmerged
 
                 if self.lora_bias[active_adapter]:
-                    self.get_base_layer().bias.data -= self.lora_B[active_adapter].bias * self.scaling[active_adapter]
+                    base_bias = self.get_base_layer().bias
+                    if base_bias is None:
+                        raise RuntimeError(
+                            "Impossible to unmerge LoRA with `lora_bias=True` because the base layer has no bias."
+                        )
+                    bias_delta = self.get_delta_bias(active_adapter).to(base_bias.dtype)
+                    base_bias.data -= bias_delta
 
     def get_delta_weight(self, adapter) -> torch.Tensor:
         """
@@ -1513,12 +1556,13 @@ class _ConvNd(nn.Module, LoraLayer):
                             raise RuntimeError(
                                 "Impossible to merge LoRA with `lora_bias=True` because the base layer has no bias."
                             )
-                        new_bias = base_layer.bias + self.lora_B[active_adapter].bias * self.scaling[active_adapter]
+                        bias_delta = self.get_delta_bias(active_adapter).to(base_layer.bias.dtype)
+                        new_bias = base_layer.bias + bias_delta
                         if not torch.isfinite(new_bias).all():
                             raise ValueError(
                                 f"NaNs detected in the merged weights. The adapter {active_adapter} seems to be broken"
                             )
-                        base_layer.bias.data = new_bias.to(orig_dtype)
+                        base_layer.bias.data = new_bias
 
                 else:
                     if active_adapter not in self.lora_variant:  # vanilla LoRA
@@ -1532,7 +1576,8 @@ class _ConvNd(nn.Module, LoraLayer):
                             raise RuntimeError(
                                 "Impossible to merge LoRA with `lora_bias=True` because the base layer has no bias."
                             )
-                        base_layer.bias.data += self.lora_B[active_adapter].bias * self.scaling[active_adapter]
+                        bias_delta = self.get_delta_bias(active_adapter).to(base_layer.bias.dtype)
+                        base_layer.bias.data += bias_delta
 
                 self.merged_adapters.append(active_adapter)
 
@@ -1556,7 +1601,13 @@ class _ConvNd(nn.Module, LoraLayer):
                     weight.data = unmerged
 
                 if self.lora_bias[active_adapter]:
-                    self.get_base_layer().bias.data -= self.lora_B[active_adapter].bias * self.scaling[active_adapter]
+                    base_bias = self.get_base_layer().bias
+                    if base_bias is None:
+                        raise RuntimeError(
+                            "Impossible to unmerge LoRA with `lora_bias=True` because the base layer has no bias."
+                        )
+                    bias_delta = self.get_delta_bias(active_adapter).to(base_bias.dtype)
+                    base_bias.data -= bias_delta
 
     def get_delta_weight(self, adapter) -> torch.Tensor:
         """
