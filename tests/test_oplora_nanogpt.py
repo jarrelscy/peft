@@ -275,3 +275,54 @@ def test_oplora_with_nanogpt_forward_backward(tmp_path):
             expected_bias = snapshot["bias_before"] + snapshot["delta_bias"].to(merged_module.bias.dtype)
             assert torch.allclose(merged_module.bias, expected_bias, atol=1e-5, rtol=1e-4)
 
+
+def test_oplora_save_and_load_consistency(tmp_path):
+    torch.manual_seed(1234)
+    config = NanoGPTConfig(vocab_size=24, block_size=8, n_layer=1, n_head=2, n_embd=16, dropout=0.0)
+    base_model = NanoGPT(config)
+
+    lora_config = LoraConfig(
+        r=2,
+        lora_alpha=4,
+        target_modules=["c_attn", "c_proj", "c_fc"],
+        use_oplora=True,
+        op_lora_k=2,
+        lora_bias=True,
+        task_type=TaskType.CAUSAL_LM,
+    )
+
+    peft_model: PeftModel = get_peft_model(base_model, lora_config)
+    peft_model.train()
+
+    optimizer = torch.optim.Adam(peft_model.parameters(), lr=5e-3)
+
+    torch.manual_seed(4321)
+    inputs = torch.randint(0, config.vocab_size, (1, config.block_size))
+    targets = torch.randint(0, config.vocab_size, (1, config.block_size))
+
+    outputs = peft_model(input_ids=inputs, labels=targets)
+    loss = outputs[1] if isinstance(outputs, tuple) else outputs.loss
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+
+    peft_model.eval()
+    torch.manual_seed(5678)
+    eval_inputs = torch.randint(0, config.vocab_size, (1, config.block_size))
+
+    with torch.no_grad():
+        original_logits, _ = peft_model(input_ids=eval_inputs, labels=eval_inputs)
+
+    save_dir = tmp_path / "oplora_adapter"
+    peft_model.save_pretrained(save_dir)
+
+    torch.manual_seed(1234)
+    reloaded_base = NanoGPT(config)
+    reloaded_model = PeftModel.from_pretrained(reloaded_base, save_dir)
+    reloaded_model.eval()
+
+    with torch.no_grad():
+        reloaded_logits, _ = reloaded_model(input_ids=eval_inputs, labels=eval_inputs)
+
+    assert torch.allclose(reloaded_logits, original_logits, atol=1e-6, rtol=1e-5)
+
