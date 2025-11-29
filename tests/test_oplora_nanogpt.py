@@ -152,21 +152,23 @@ def test_oplora_with_nanogpt_forward_backward(tmp_path):
     inputs = torch.randint(0, config.vocab_size, (2, config.block_size))
     targets = torch.randint(0, config.vocab_size, (2, config.block_size))
 
-    outputs = peft_model(input_ids=inputs, labels=targets)
-    if isinstance(outputs, tuple):
-        if len(outputs) == 0:
-            raise AssertionError("Expected non-empty output tuple from NanoGPT")
-        logits = outputs[0]
-        loss = outputs[1] if len(outputs) > 1 else None
-    else:
-        logits = outputs.logits
-        loss = outputs.loss
-    assert logits.shape == (2, config.block_size, config.vocab_size)
-    assert loss is not None and torch.isfinite(loss)
+    train_steps = 50
+    for _ in range(train_steps):
+        outputs = peft_model(input_ids=inputs, labels=targets)
+        if isinstance(outputs, tuple):
+            if len(outputs) == 0:
+                raise AssertionError("Expected non-empty output tuple from NanoGPT")
+            logits = outputs[0]
+            loss = outputs[1] if len(outputs) > 1 else None
+        else:
+            logits = outputs.logits
+            loss = outputs.loss
+        assert logits.shape == (2, config.block_size, config.vocab_size)
+        assert loss is not None and torch.isfinite(loss)
 
-    optimizer.zero_grad()
-    loss.backward()
-    optimizer.step()
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
 
     adapter_name = peft_model.active_adapters[0]
     first_block = peft_model.base_model.model.transformer["h"][0]
@@ -300,11 +302,13 @@ def test_oplora_save_and_load_consistency(tmp_path):
     inputs = torch.randint(0, config.vocab_size, (1, config.block_size))
     targets = torch.randint(0, config.vocab_size, (1, config.block_size))
 
-    outputs = peft_model(input_ids=inputs, labels=targets)
-    loss = outputs[1] if isinstance(outputs, tuple) else outputs.loss
-    optimizer.zero_grad()
-    loss.backward()
-    optimizer.step()
+    train_steps = 50
+    for _ in range(train_steps):
+        outputs = peft_model(input_ids=inputs, labels=targets)
+        loss = outputs[1] if isinstance(outputs, tuple) else outputs.loss
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
 
     peft_model.eval()
     torch.manual_seed(5678)
