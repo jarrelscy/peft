@@ -35,21 +35,22 @@ lines-after-imports = 2
 known-first-party = ["peft"]
 
 [tool.pytest]
+addopts = [
+    "--cov=src/peft",
+    "--cov-report=term-missing",
+    "--durations=10",
+]
 doctest_optionflags = [
     "NORMALIZE_WHITESPACE",
     "ELLIPSIS",
     "NUMBER",
 ]
-
-[tool.pytest.ini_options]
-addopts = "--cov=src/peft --cov-report=term-missing --durations=10"
 markers = [
     "single_gpu_tests: tests that run on a single GPU",
     "multi_gpu_tests: tests that run on multiple GPUs",
     "regression: whether to run regression suite test",
-    "bitsandbytes: select bitsandbytes integration tests"
+    "bitsandbytes: select bitsandbytes integration tests",
 ]
-
 filterwarnings = [
     "error::DeprecationWarning:transformers",
     "error::FutureWarning:transformers",
