@@ -156,17 +156,17 @@ class LoraLayer(BaseTunerLayer):
         return weight_tensor.detach()
 
     def _compute_truncated_svd(self, matrix: torch.Tensor, rank: int) -> tuple[torch.Tensor, torch.Tensor]:
-        matrix = matrix.to(torch.float32)
+        matrix = matrix.to(torch.float64)
         try:
             U, S, Vh = torch.linalg.svd(matrix, full_matrices=False)
             return U[:, :rank], Vh[:rank, :].transpose(0, 1)
         except RuntimeError:
             pass
 
-        U, S, V = svd_lowrank(matrix, q=rank, niter=8)
+        U, S, V = svd_lowrank(matrix.float(), q=rank, niter=8)
         if U.shape[1] < rank or V.shape[1] < rank:
             raise RuntimeError("Failed to compute truncated SVD for OPLoRA projector construction.")
-        return U[:, :rank], V[:, :rank]
+        return U[:, :rank].double(), V[:, :rank].double()
 
     def _configure_oplora(self, adapter_name: str, use_oplora: bool, op_lora_k: Optional[int]) -> None:
         self._clear_oplora_state(adapter_name)
@@ -196,8 +196,8 @@ class LoraLayer(BaseTunerLayer):
             raise ValueError("`op_lora_k` is too large for the target layer.")
 
         U, V = self._compute_truncated_svd(weight_tensor, effective_rank)
-        left_projector = torch.eye(m, dtype=torch.float32, device=weight_tensor.device) - U @ U.transpose(0, 1)
-        right_projector = torch.eye(n, dtype=torch.float32, device=weight_tensor.device) - V @ V.transpose(0, 1)
+        left_projector = torch.eye(m, dtype=torch.float64, device=weight_tensor.device) - U @ U.transpose(0, 1)
+        right_projector = torch.eye(n, dtype=torch.float64, device=weight_tensor.device) - V @ V.transpose(0, 1)
 
         if adapter_name in self.lora_B:
             left_weight = self.lora_B[adapter_name].weight
@@ -214,12 +214,10 @@ class LoraLayer(BaseTunerLayer):
             right_weight = weight_tensor
 
         left_device = left_weight.device
-        left_dtype = left_weight.dtype
         right_device = right_weight.device
-        right_dtype = right_weight.dtype
 
-        self._oplora_left_projectors[adapter_name] = left_projector.to(device=left_device, dtype=left_dtype)
-        self._oplora_right_projectors[adapter_name] = right_projector.to(device=right_device, dtype=right_dtype)
+        self._oplora_left_projectors[adapter_name] = left_projector.to(device=left_device)
+        self._oplora_right_projectors[adapter_name] = right_projector.to(device=right_device)
         self.use_oplora[adapter_name] = True
         self.oplora_rank[adapter_name] = effective_rank
 
@@ -239,15 +237,15 @@ class LoraLayer(BaseTunerLayer):
         left_projector = self._oplora_left_projectors[adapter]
         right_projector = self._oplora_right_projectors[adapter]
 
-        left_projector = left_projector.to(device=weight_B.device, dtype=weight_B.dtype)
-        right_projector = right_projector.to(device=weight_A.device, dtype=weight_A.dtype)
+        left_projector = left_projector.to(device=weight_B.device)
+        right_projector = right_projector.to(device=weight_A.device)
 
-        projected_B = left_projector @ weight_B
-        projected_A = weight_A @ right_projector
+        projected_B = left_projector @ weight_B.to(torch.float64)
+        projected_A = weight_A.to(torch.float64) @ right_projector
 
         projected_bias = bias
         if bias is not None:
-            projected_bias = left_projector @ bias.to(device=weight_B.device, dtype=weight_B.dtype)
+            projected_bias = (left_projector @ bias.to(device=weight_B.device, dtype=torch.float64)).to(bias.dtype)
 
         return projected_A, projected_B, projected_bias
 
@@ -975,8 +973,6 @@ class Linear(nn.Module, LoraLayer):
         output_tensor = transpose(projected_B @ projected_A, self.fan_in_fan_out) * self.scaling[adapter]
 
         if cast_to_fp32:
-            output_tensor = output_tensor.to(dtype=dtype)
-
             # cast back the weights
             self.lora_A[adapter].weight.data = weight_A.to(dtype)
             self.lora_B[adapter].weight.data = weight_B.to(dtype)
@@ -1019,8 +1015,9 @@ class Linear(nn.Module, LoraLayer):
                             lora_B.weight,
                             lora_B.bias,
                         )
-                        intermediate = F.linear(dropped_input, projected_A)
-                        result = result + F.linear(intermediate, projected_B, projected_bias) * scaling
+                        lora_dtype = lora_A.weight.dtype
+                        intermediate = F.linear(dropped_input, projected_A.to(lora_dtype))
+                        result = result + F.linear(intermediate, projected_B.to(lora_dtype), projected_bias) * scaling
                     else:
                         result = result + lora_B(lora_A(dropped_input)) * scaling
                 else:
@@ -1247,10 +1244,9 @@ class Embedding(nn.Module, LoraLayer):
 
         projected_A, projected_B, _ = self._get_projected_lora_weights(adapter, weight_A, weight_B)
         output_tensor = transpose(projected_B @ projected_A, True) * self.scaling[adapter]
+        output_tensor = output_tensor.to(dtype)
 
         if cast_to_fp32:
-            output_tensor = output_tensor.to(dtype=dtype)
-
             # cast back the weights
             self.lora_embedding_A[adapter] = weight_A.to(dtype)
             self.lora_embedding_B[adapter] = weight_B.to(dtype)
@@ -1279,13 +1275,14 @@ class Embedding(nn.Module, LoraLayer):
             if active_adapter not in self.lora_embedding_A.keys():
                 continue
 
+            embed_dtype = self.lora_embedding_A[active_adapter].dtype
             projected_A, projected_B, _ = self._get_projected_lora_weights(
                 active_adapter,
                 self.lora_embedding_A[active_adapter],
                 self.lora_embedding_B[active_adapter],
             )
-            embedding_A = projected_A.T
-            embedding_B = projected_B.T
+            embedding_A = projected_A.to(embed_dtype).T
+            embedding_B = projected_B.to(embed_dtype).T
             scaling = self.scaling[active_adapter]
 
             # getting the sub-batch, passing it to LoRA layers and updating the corresponding indices of the linear
@@ -1340,13 +1337,14 @@ class Embedding(nn.Module, LoraLayer):
                     continue
 
                 if active_adapter not in self.lora_variant:  # vanilla LoRA
+                    embed_dtype = self.lora_embedding_A[active_adapter].dtype
                     projected_A, projected_B, _ = self._get_projected_lora_weights(
                         active_adapter,
                         self.lora_embedding_A[active_adapter],
                         self.lora_embedding_B[active_adapter],
                     )
-                    embedding_A = projected_A.T
-                    embedding_B = projected_B.T
+                    embedding_A = projected_A.to(embed_dtype).T
+                    embedding_B = projected_B.to(embed_dtype).T
                     scaling = self.scaling[active_adapter]
                     after_A = self._embed(x, embedding_A)
                     adapter_output = (after_A @ embedding_B) * scaling
