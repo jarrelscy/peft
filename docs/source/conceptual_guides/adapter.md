@@ -47,6 +47,12 @@ In principle, LoRA can be applied to any subset of weight matrices in a neural n
 </div>
 <small><a href="https://hf.co/papers/2103.10385">Navigating Text-To-Image Customization: From LyCORIS Fine-Tuning to Model Evaluation</a></small>
 
+## Orthogonal Projection LoRA (OPLoRA)
+
+Orthogonal Projection LoRA augments standard LoRA with an explicit safeguard that prevents the low-rank update from modifying the principal directions of the frozen weight matrix. The pretrained weight \(W_0\) is decomposed with a truncated singular value decomposition, and the top-\(k\) left and right singular vectors define orthogonal projectors. During training and inference, the LoRA factors are projected through these bases so that the effective update \(\Delta W\) lives in the orthogonal complement of the preserved subspace. This keeps the most expressive directions of \(W_0\) intact while still allowing adaptation capacity in the remaining dimensions. The hyperparameter `op_lora_k` controls how many singular vectors are protected: higher values preserve more of the original model at the cost of a smaller trainable subspace.
+
+To monitor how much an adapter interferes with the protected subspace, each OPLoRA layer exposes a `compute_subspace_alignment` helper that returns the alignment metric \(\rho_k\) described in the paper. The closer this value is to zero, the better the adapter respects the orthogonality constraint.
+
 ## Mixture of LoRA Experts (X-LoRA)
 
 [X-LoRA](https://huggingface.co/papers/2402.07148) is a mixture of experts method for LoRA which works by using dense or sparse gating to dynamically activate LoRA experts. The LoRA experts as well as the base model are frozen during training, resulting in a low parameter count as only the gating layers must be trained. In particular, the gating layers output scalings which (depending on config) are granular on the layer and token level. Additionally, during inference, X-LoRA dynamically activates LoRA adapters to recall knowledge and effectively mix them:

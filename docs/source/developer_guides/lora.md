@@ -317,6 +317,35 @@ on a 4090 with gradient accumulation set to 2 and max step to 20 resulted with t
 - DoRA introduces a bigger overhead than pure LoRA, so it is recommended to merge weights for inference, see [`LoraModel.merge_and_unload`].
 - DoRA should work with weights quantized with bitsandbytes ("QDoRA"). However, issues have been reported when using QDoRA with DeepSpeed Zero2.
 
+### Orthogonal Projection LoRA (OPLoRA)
+
+OPLoRA preserves the principal directions of each frozen weight matrix by projecting the LoRA factors onto the orthogonal complement of the top singular vectors of the base weights. Enable it by setting `use_oplora=True` and choosing how many directions to preserve with `op_lora_k`:
+
+```py
+from peft import LoraConfig, get_peft_model
+from peft.utils import TaskType
+
+config = LoraConfig(
+    task_type=TaskType.CAUSAL_LM,
+    r=8,
+    lora_alpha=16,
+    target_modules=["q_proj", "k_proj", "v_proj"],
+    use_oplora=True,
+    op_lora_k=6,
+)
+model = get_peft_model(model, config)
+```
+
+`op_lora_k` must be a positive integer that does not exceed the minimum dimension of the targeted weight matrix. When the rank is higher than the layer allows, PEFT automatically caps it to the layer's shape. OPLoRA currently supports linear and embedding adapters; convolutional layers will raise an error when `use_oplora=True`.
+
+Each OPLoRA-enabled module exposes `compute_subspace_alignment` to monitor how much the adapter interferes with the preserved subspace. This returns the alignment score \(\rho_k\) from the paper, where values near zero indicate the update stays orthogonal to the protected directions:
+
+```py
+adapter = model.active_adapters[0]
+alignment = model.base_model.model.layers[0].self_attn.q_proj.compute_subspace_alignment(adapter)
+print(f"Alignment with preserved subspace: {alignment:.4f}")
+```
+
 ### QLoRA-style training
 
 The default LoRA settings in PEFT add trainable weights to the query and value layers of each attention block. But [QLoRA](https://hf.co/papers/2305.14314), which adds trainable weights to all the linear layers of a transformer model, can provide performance equal to a fully finetuned model. To apply LoRA to all the linear layers, like in QLoRA, set `target_modules="all-linear"` (easier than specifying individual modules by name which can vary depending on the architecture).
